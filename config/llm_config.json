@@ -1,0 +1,17 @@
+{
+    "general_setting": {
+        "host": "127.0.0.1",
+        "port": 8000
+    },
+    "paths": {
+        "log_file_path": "logs"
+    },
+    "retrieval": {
+        "top_k": 2,
+        "max_distance": 1.5
+    },
+    "DB_NAME": "data/vet_doc.db",
+    "CHAT_HISTORY_DB": "data/chat_history.db",
+    "FAISS_INDEX_FILE": "src/vectordb/vet_doc.index",
+    "TFIDF_VECTORIZER_FILE": "src/vectordb/vet_doc_tfidf_vectorizer.joblib"
+}

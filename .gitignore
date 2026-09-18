@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+logs/
+data/chat_history.db
+src/vectordb/*.index
+src/vectordb/*.joblib
+.pytest_cache/
+.DS_Store
