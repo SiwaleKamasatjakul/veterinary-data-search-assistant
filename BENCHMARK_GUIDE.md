@@ -5,25 +5,12 @@ mean, and what a "ground truth dataset" is. No prior knowledge assumed.
 
 ---
 
-## 1. The big idea: it's a report card
+## Evaluation Baseline (Ground Truth)
 
-We are testing a **search engine**, not the chatbot. The question is always the same:
 
-> A cat owner types some symptoms. Does the search find the right disease record?
+Retrieval performance is evaluated using a Ground-Truth Dataset—a standard test suite mapping natural language symptom queries directly to their corresponding SQL primary key (expected_data_id). These verified query-record pairs allow the automated harness to continuously benchmark retrieval accuracy, rank depth, and confidence threshold separation across multiple system configurations.
 
-To grade that, you need to already know the right answer for each question. That list of
-"question → right answer" pairs is called the **ground truth**.
 
-```
-┌──────────────────────┐     ┌─────────────────┐     ┌──────────┐
-│  GROUND TRUTH        │     │  THE SEARCH     │     │  GRADE   │
-│  question + answer   │ ──► │  (the student)  │ ──► │  ✅ / ❌ │
-│  data/testset.csv    │     │                 │     │          │
-└──────────────────────┘     └─────────────────┘     └──────────┘
-```
-
-Each row of the table is **one student taking the same exam**. Same 167 questions every
-time, so the scores are comparable.
 
 ---
 
