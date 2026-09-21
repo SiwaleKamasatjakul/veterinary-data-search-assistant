@@ -1,12 +1,10 @@
-# Veterinary Cat Store Chatbot — macOS
+# Veterinary Data Search Assistant & RAG Pipeline
 
-A macOS-ready rebuild of `ChatbotCatStoreLinux`. Same architecture, same API contract,
-same knowledge base — with the portability blockers and several latent bugs fixed, plus a
-pluggable embedding backend and a retrieval benchmark.
+An automated Retrieval-Augmented Generation (RAG) assistant that translates unstructured, colloquial pet symptom queries into grounded SQL clinical definitions and relevant retail product recommendations.
 
 ```
 user question
-   └─> embedder   TF-IDF char n-grams (default)  ·  OpenAI text-embedding-3-small (opt-in)
+   └─> embedder   OpenAI text-embedding-3-small 
         └─> FAISS IndexIDMap2(IndexFlatIP) over the vet_doc knowledge base
              └─> unit vectors, so the score IS cosine similarity (-1..1, higher is better)
                   └─> top-k above min_similarity → matched disease records
