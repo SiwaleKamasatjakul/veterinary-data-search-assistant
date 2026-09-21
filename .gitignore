@@ -8,3 +8,8 @@ src/vectordb/*.index
 src/vectordb/*.joblib
 .pytest_cache/
 .DS_Store
+data/embedding_cache.db
+src/vectordb/*.json
+data/new_records_template.csv
+data/testset.csv
+benchmark_results/

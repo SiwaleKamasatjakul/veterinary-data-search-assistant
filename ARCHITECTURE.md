@@ -7,6 +7,9 @@ into the prompt, and the LLM answers using *those records* rather than its own g
 This document is the map. Read it top to bottom once (~15 min), then use the
 [Where do I change X?](#where-do-i-change-x) table as your day-to-day reference.
 
+> **New to retrieval benchmarks?** [BENCHMARK_GUIDE.md](BENCHMARK_GUIDE.md) explains every
+> column in the benchmark output, and what a ground-truth dataset is.
+
 ---
 
 ## 1. Why this exists
@@ -56,13 +59,13 @@ POST /message_handler/
   │            ┌──────────────────────────────────────────────────┐
   │            │ tools/SearchVecDoc.py     (thin facade, logs)     │
   │            │   └─> tools/ImportDB2Faiss.py  VetFAISS.search…() │
-  │            │         a. load FAISS index + TF-IDF vectorizer   │
-  │            │         b. vectorize the query                    │
-  │            │         c. index.search() → distances + positions │
-  │            │         d. map positions → SQLite rows            │
-  │            │         e. drop anything past max_distance        │
+  │            │         a. load index + embedder (cached in-proc) │
+  │            │         b. embed the query (tfidf or openai)       │
+  │            │         c. index.search() → cosine scores + ids    │
+  │            │         d. fetch those data_ids from SQLite        │
+  │            │         e. drop anything below min_similarity      │
   │            └──────────────────────────────────────────────────┘
-  │                                    │  [{disease, symptoms, cause, treatment, distance}]
+  │                                    │  [{data_id, disease, symptoms, cause, treatment, score}]
   ▼                                    ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ core/generate_response.py         generate_response()           │
@@ -145,7 +148,9 @@ touching the API. You can `from tools.ImportDB2Faiss import VetFAISS` in a plain
 
 | File | Responsibility | You'll touch it when… |
 |---|---|---|
-| `src/tools/ImportDB2Faiss.py` | **The heart.** `VetDB` (SQLite CRUD) + `VetFAISS` (build/search). Both vector operations live here | Changing the embedding method, index type, or ranking |
+| `src/tools/ImportDB2Faiss.py` | **The heart.** `VetDB` (SQLite CRUD) + `VetFAISS` (build/search). Index type, ID mapping, thresholding | Changing index type or ranking |
+| `src/tools/embedders.py` | `TfidfEmbedder` and `OpenAIEmbedder` behind one interface. See §13 | Adding a backend, changing n-grams or model |
+| `src/tools/embedding_cache.py` | Caches OpenAI vectors by `(model, sha256(text))` so rebuilds are cheap | Rarely |
 | `src/tools/SearchVecDoc.py` | Thin facade over `VetFAISS`. Exists for naming compatibility with the original | Almost never — it's 12 lines |
 
 ### Infrastructure
@@ -212,7 +217,7 @@ build that door on day one, not after the first incident.
 
 Read these before you touch the retrieval code.
 
-### 6.1 The index maps by *position*, not by ID
+### 6.1 ~~The index maps by *position*, not by ID~~ — FIXED (see §13)
 
 `build_index()` calls `index.add(vectors)` — no IDs. FAISS returns positions `0..n-1`, and
 `search_vet_doc()` maps them with `records[record_pos]`, where `records` came from
@@ -222,8 +227,10 @@ Read these before you touch the retrieval code.
 the search starts returning *the wrong record with a confident-looking distance*. No error, no
 warning — just wrong answers.
 
-Today this is contained because `lifespan` builds the index at startup and there is no delete
-endpoint. If you add one, fix the mapping first:
+**This is now fixed.** `build_index()` uses `IndexIDMap2` and `add_with_ids(vectors, data_ids)`,
+so FAISS returns database IDs. Verified by deleting a row without rebuilding — the query still
+returns the correct record. The history is kept here because it explains why the code looks the
+way it does. The fix was:
 
 ```python
 # in build_index()
@@ -257,7 +264,11 @@ If you ever fix the schema, that's the one function to update.
 
 ## 7. Optimization: measured, not guessed
 
-Profiled on the current 8-record dataset:
+> **Status: fixes #1 and #2 below are now APPLIED (see §13).** Search went 2.73 ms → 0.73 ms,
+> and row lookup is `WHERE data_id IN (…)` instead of `SELECT *`. The analysis is kept because
+> the method — profile before optimising — is the transferable part.
+
+Profiled on the original 8-record dataset, before the fixes:
 
 | Operation | Time |
 |---|---|
@@ -353,9 +364,11 @@ do it after retrieval is solid.
 |---|---|
 | Add disease records | `data/seed_vet_doc.json` → `python scripts/build_index.py --reseed` |
 | Change how many results are retrieved | `config/llm_config.json` → `retrieval.top_k` |
-| Make retrieval stricter or looser | `config/llm_config.json` → `retrieval.max_distance` |
+| Make retrieval stricter or looser | `config/llm_config.json` → `retrieval.min_similarity.<backend>` (higher = stricter) |
 | Change what text gets embedded | `ImportDB2Faiss.py` → `_search_text()` |
-| Change the embedding method | `ImportDB2Faiss.py` → `build_index()` **and** `search_vet_doc()` |
+| Switch tfidf ↔ openai embeddings | `config/llm_config.json` → `retrieval.backend`, then rebuild (§13) |
+| Add a third embedding backend | `tools/embedders.py` — subclass `BaseEmbedder`, add to `make_embedder()` |
+| Force a full re-embed | `EmbeddingCache(...).clear()` then `build_index.py` |
 | Change the system prompt | `prompts.py` → `DEFAULT_SYSTEM_PROMPT` |
 | Change what the model actually receives | `generate_response.py` → `build_messages()` |
 | Change the response JSON | `Formatter/response_formatter.py` |
@@ -409,15 +422,196 @@ no excuse to skip them.
 
 Honest list, roughly by priority:
 
-1. **Position-based index mapping** (§6.1) — a correctness bug waiting for a delete endpoint
-2. **State reloaded from disk on every search** (§7) — 13× slower than it needs to be
-3. **`SELECT *` on every search** (§7) — linear in table size
-4. **`parameters.stream` is accepted and ignored** — the formatters exist, the wiring doesn't
-5. **No auth** — anyone who can reach the port can spend your OpenAI budget
-6. **Chat history grows unbounded** — no retention policy, no cleanup
-7. **`refdata` is overloaded** — caller-supplied on input, retrieved records on output
-8. **Shifted column names** (§6.2) — works, but every new reader loses ten minutes to it
-9. **Only 4 tests** — no coverage of retrieval quality; a regression in ranking is invisible
+~~1. Position-based index mapping~~ — **fixed**, `IndexIDMap2` (§13)
+~~2. State reloaded from disk on every search~~ — **fixed**, in-process cache, 2.73 → 0.73 ms
+~~3. `SELECT *` on every search~~ — **fixed**, `WHERE data_id IN (…)`
+~~9. No retrieval-quality tests~~ — **fixed**, `scripts/check_retrieval.py`, 18 cases
 
-Number 9 is the one that will bite you silently. A small CSV of *query → expected disease*
-asserted in CI would turn retrieval quality from a vibe into a number.
+Still open:
+
+1. **`parameters.stream` is accepted and ignored** — the formatters exist, the wiring doesn't
+2. **No auth** — anyone who can reach the port can spend your OpenAI budget
+3. **Chat history grows unbounded** — no retention policy, no cleanup
+4. **`refdata` is overloaded** — caller-supplied on input, retrieved records on output
+5. **Shifted column names** (§6.2) — works, but every new reader loses ten minutes to it
+6. **The openai backend has never made a live call** (§13) — structure is tested, the API
+   round trip is not. Run `check_retrieval.py --tune --backend openai` before trusting it
+7. **One retrieval test passes on a 0.017 margin** — constipation vs FLUTD. Adding a third
+   excretion-related disease will likely flip it
+8. **No per-record provenance** — nothing records which vet reviewed a record, or when
+
+Number 6 is the one to close first if you intend to ship the openai backend.
+
+---
+
+## 12. Adding records to the knowledge base
+
+```bash
+python scripts/add_vet_doc.py --json data/new_records.json   # add + rebuild + verify
+python scripts/add_vet_doc.py --csv  data/records.csv        # from a spreadsheet
+python scripts/add_vet_doc.py --interactive                  # type them in
+python scripts/add_vet_doc.py --template                     # CSV template for a vet
+python scripts/check_retrieval.py --tune                     # regression + threshold check
+```
+
+Restart the API afterwards — the index is read at startup.
+
+The script speaks in **honest field names** (`--disease`, `--symptoms`, `--cause`,
+`--treatment`) and maps them to the shifted DB columns for you, so you never have to
+remember §6.2. It dedupes by disease name, mirrors additions into `seed_vet_doc.json`, and
+verifies each new record retrieves itself.
+
+Whether a rebuild re-embeds everything depends on the backend — see §13. With `tfidf` it
+always refits; with `openai` only new or edited text is sent to the API.
+
+### Writing a record that actually gets retrieved
+
+The `symptoms` field is the only text that gets embedded. Write it **the way an owner would
+describe it**, not the way a vet would write it.
+
+This is not theoretical. The FLUTD record originally said only `ปัสสาวะ`. The query
+`แมวตัวผู้เบ่งฉี่นานแต่ไม่ออก` (colloquial `ฉี่`) returned **Constipation** instead —
+`เบ่ง...นานแต่ไม่ออก` matched the constipation text almost exactly while `ฉี่` matched
+nothing. On the most time-critical query in the knowledge base.
+
+Adding `ฉี่` and `เยี่ยว` fixed it. With the current cosine scoring, FLUTD now wins that
+query 0.4663 to 0.2717.
+
+With the `openai` backend this class of failure largely disappears — `ฉี่` and `ปัสสาวะ` are
+close in embedding space. **Write the colloquial synonyms anyway.** They cost nothing and
+they are the difference between working and not working on the free backend.
+
+### After every data change, re-tune the threshold
+
+`check_retrieval.py --tune` measures the gap between the lowest correct hit and the highest
+off-topic score, then prints a value that separates them. Current measurement (tfidf, 20
+records):
+
+| | cosine |
+|---|---|
+| Correct hits (18 queries) | 0.2098 – 0.7409 |
+| Off-topic queries (weather, coffee shops, python) | ≤ 0.1794 |
+| **min_similarity** | **0.19** |
+
+Thresholds move as the corpus grows. This one has already changed twice.
+
+### Watch the margin
+
+`check_retrieval.py` reports the gap between the top hit and the runner-up. A pass under
+0.05 is fragile. Currently `แมวเบ่งอึไม่ออกหลายวันแล้ว` passes by **0.017**, because
+constipation and FLUTD share so much phrasing. Add a third excretion-related disease and
+expect it to flip.
+
+---
+
+## 13. Embedding backends (tfidf | openai)
+
+`retrieval.backend` in `config/llm_config.json` chooses how text becomes vectors.
+Everything above `tools/` is unaware of which is active.
+
+```
+core/ ── tools/SearchVecDoc ── tools/ImportDB2Faiss ──┬── tools/embedders.py
+                                                       │      TfidfEmbedder  (local, free)
+                                                       │      OpenAIEmbedder (API, semantic)
+                                                       └── tools/embedding_cache.py
+```
+
+### Switching
+
+```bash
+# in .env
+OPENAI_API_KEY=sk-...
+# in config/llm_config.json
+"backend": "openai"
+
+python scripts/build_index.py        # re-embeds everything once
+python scripts/check_retrieval.py --tune
+```
+
+`RETRIEVAL_BACKEND=openai` as an env var overrides the config for one run, which is how
+`check_retrieval.py --backend openai` works. The index records which backend built it; if
+config and index disagree, the index rebuilds automatically on startup.
+
+### The contract every embedder honours
+
+**Return L2-normalised float32 vectors.** With unit vectors, FAISS `IndexFlatIP`
+(inner product) *is* cosine similarity. That gives one score scale for both backends:
+`-1..1`, **higher is better**, threshold reads as `min_similarity`.
+
+> ⚠️ This is a polarity flip from the pre-refactor code, which used `IndexFlatL2` and an
+> upper bound on *distance*. Old notes saying "lower is better" are stale. For unit
+> vectors the two relate as `L2² = 2(1 − cos)`.
+
+### `is_corpus_coupled` — the property that drives everything else
+
+| | tfidf | openai |
+|---|---|---|
+| Vector depends on | the whole corpus | that text alone |
+| Adding a record | **full refit required** | embed just the new one |
+| Cacheable | no | yes |
+| Cost | free | per token |
+| Dimensions | grows (3,400 at 20 records) | fixed 1,536 |
+| `ฉี่` vs `ปัสสาวะ` | no match — zero shared n-grams | matches |
+
+`build_index()` branches on this flag: TF-IDF refits from scratch, OpenAI goes through the
+embedding cache.
+
+### The embedding cache
+
+`data/embedding_cache.db`, keyed by `(model, sha256(text))`. A rebuild only sends text that
+actually changed. Verified: 20 records → 20 API calls' worth on first build, 0 on rebuild,
+1 when a single record is added.
+
+Batching is 128 texts per request. The API may return items out of order, so responses are
+re-sorted by `.index` before use — getting this wrong silently misassigns every vector.
+
+```python
+from tools.embedding_cache import EmbeddingCache
+EmbeddingCache("data/embedding_cache.db").stats()   # what is cached
+EmbeddingCache("data/embedding_cache.db").clear()   # force a full re-embed
+```
+
+### Thresholds are per backend
+
+```json
+"min_similarity": { "tfidf": 0.19, "openai": 0.35 }
+```
+
+The scales differ, so a single number cannot serve both. `check_retrieval.py --tune`
+measures the gap between the lowest correct hit and the highest off-topic score, and prints
+a value that separates them. Measured for tfidf at 20 records:
+
+| | cosine |
+|---|---|
+| Correct hits (18 queries) | 0.2098 – 0.7409 |
+| Off-topic noise | ≤ 0.1794 |
+| **Chosen threshold** | **0.19** |
+
+**The openai value of 0.35 is a starting estimate, not a measurement** — it has not been
+run against a live key. Run `--tune --backend openai` after you switch and set the real one.
+
+### What this refactor also fixed
+
+- **Landmine §6.1 is gone.** `IndexIDMap2` stores vectors against `data_id`, so a search
+  returns database IDs. Verified by deleting a row without rebuilding: the query still
+  returns the correct record instead of silently shifting.
+- **Landmine §7.2 is gone.** Lookup is `WHERE data_id IN (…)` for the top-k rows only,
+  not `SELECT *` over the table.
+- **§7.1 fix applied.** Index and embedder are cached in-process, keyed on the index file's
+  `mtime_ns` so a rebuild self-invalidates. Measured **2.73 ms → 0.73 ms** per search.
+
+### Cost, honestly
+
+`text-embedding-3-small` is priced per token and your corpus is 20 short records — a full
+rebuild is a fraction of a cent. The cache means you rarely pay even that. The per-query
+embedding call is the ongoing cost, and it is dwarfed by the chat completion that follows it.
+The real trade-off is **latency**: a network round trip per query (~50–200 ms) replaces
+0.73 ms of local math.
+
+### Testing status
+
+| | |
+|---|---|
+| tfidf path | fully tested — 8 pytest cases, 18/18 retrieval, live API verified |
+| openai path | structure tested with a stand-in client (batching, ordering, normalisation, cache hit/miss) |
+| openai live call | **not tested — no API key available.** Run `build_index.py` then `check_retrieval.py --tune --backend openai` as your first step |

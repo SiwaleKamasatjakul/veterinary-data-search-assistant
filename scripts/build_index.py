@@ -48,8 +48,8 @@ def main() -> int:
 
     query = "แมวขนร่วงเป็นวง ๆ ผิวหนังแดง คัน"
     print(f"\n🔍 Smoke test: {query}")
-    for hit in VetFAISS.search_vet_doc(query, top_k=3):
-        print(f"   [{hit['distance']}] {hit['disease']}")
+    for hit in VetFAISS.search_vet_doc(query, top_k=3, min_similarity=-1):
+        print(f"   [{hit['score']}] {hit['disease']}")
 
     return 0 if count else 1
 

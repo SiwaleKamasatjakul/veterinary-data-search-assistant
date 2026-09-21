@@ -46,7 +46,31 @@ def build_messages(message: Chatbot_Messages):
     return messages
 
 
-async def generate_response(message: Chatbot_Messages, prompt_type: str = "chatbot") -> dict:
+
+def describe_messages(messages) -> list[dict]:
+    """Serialise the assembled prompt so it can be inspected in Swagger.
+
+    Roles are reported in OpenAI terms (system/user/assistant) rather than
+    LangChain class names, so what you see matches what the API receives.
+    """
+    role_of = {"SystemMessage": "system", "HumanMessage": "user", "AIMessage": "assistant"}
+    out = []
+    for i, m in enumerate(messages):
+        content = m.content if isinstance(m.content, str) else str(m.content)
+        out.append(
+            {
+                "index": i,
+                "role": role_of.get(type(m).__name__, type(m).__name__),
+                "chars": len(content),
+                "content": content,
+            }
+        )
+    return out
+
+
+async def generate_response(
+    message: Chatbot_Messages, prompt_type: str = "chatbot", debug: bool = False
+) -> dict:
     timer = MeasureTimePerformance().begin_process_time()
 
     DatabaseProcess.init_database()
@@ -75,4 +99,7 @@ async def generate_response(message: Chatbot_Messages, prompt_type: str = "chatb
     payload["mock"] = use_mock()
     payload["latency_ms"] = int(timer.get_execution_time() * 1000)
     payload["vet_doc"] = message.vet_doc
+    if debug:
+        payload["prompt_sent"] = describe_messages(messages)
+        payload["history_turns"] = (len(messages) - 2) // 2
     return payload

@@ -17,9 +17,10 @@ from __future__ import annotations
 import json
 import os
 
-from dotenv import load_dotenv
+from tools.paths import load_env
 
-load_dotenv()
+# Anchored to the project root rather than the cwd — see tools/paths.py.
+load_env()
 
 DEFAULT_MODEL_ID = "gpt-4o"
 

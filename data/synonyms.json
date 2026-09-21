@@ -1,0 +1,21 @@
+{
+  "_comment": "Vet vocabulary -> owner vocabulary. Used by the per_symptom_expanded chunking strategy: each symptom phrase is indexed once per synonym variant, so a query using the owner's word still matches. Add pairs here whenever check_retrieval or the benchmark shows a colloquial miss. Keep the KEY as the term that appears in vet_doc.",
+  "ปัสสาวะ": ["ฉี่", "เยี่ยว"],
+  "อุจจาระ": ["อึ", "ขี้"],
+  "ถ่าย": ["อึ", "ขี้"],
+  "อาเจียน": ["อ้วก", "ขย้อน"],
+  "เบื่ออาหาร": ["ไม่กินข้าว", "ไม่ยอมกิน", "กินน้อยลง"],
+  "น้ำหนักลด": ["ผอมลง", "ซูบลง", "ผอมซูบ"],
+  "ซึม": ["ไม่ร่าเริง", "นอนทั้งวัน", "ไม่มีแรง"],
+  "หายใจลำบาก": ["หอบ", "หายใจแรง", "อ้าปากหายใจ"],
+  "ขนร่วง": ["ขนหลุด", "ขนบาง"],
+  "คัน": ["เกาบ่อย", "เกาไม่หยุด"],
+  "ท้องเสีย": ["ถ่ายเหลว", "ท้องร่วง"],
+  "เหงือก": ["ขอบฟัน"],
+  "ผิวหนัง": ["หนัง"],
+  "ดื่มน้ำ": ["กินน้ำ"],
+  "เยื่อเมือก": ["เหงือก"],
+  "ชัก": ["เกร็ง", "กระตุก"],
+  "ไข้": ["ตัวร้อน"],
+  "ท้องอืด": ["ท้องบวม", "ท้องโต"]
+}

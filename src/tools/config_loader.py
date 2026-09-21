@@ -69,21 +69,47 @@ class ConfigManager:
         return {
             "DB_NAME": resolve(config.get("DB_NAME", "data/vet_doc.db")),
             "CHAT_HISTORY_DB": resolve(config.get("CHAT_HISTORY_DB", "data/chat_history.db")),
+            "EMBEDDING_CACHE": resolve(
+                config.get("EMBEDDING_CACHE", "data/embedding_cache.db")
+            ),
             "FAISS_INDEX_FILE": resolve(
                 config.get("FAISS_INDEX_FILE", "src/vectordb/vet_doc.index")
             ),
-            "TFIDF_VECTORIZER_FILE": resolve(
-                config.get("TFIDF_VECTORIZER_FILE", "src/vectordb/vet_doc_tfidf_vectorizer.joblib")
+            "EMBEDDER_FILE": resolve(
+                config.get("EMBEDDER_FILE", "src/vectordb/vet_doc_embedder.joblib")
+            ),
+            "INDEX_META_FILE": resolve(
+                config.get("INDEX_META_FILE", "src/vectordb/index_meta.json")
             ),
         }
 
     @staticmethod
     def get_retrieval_config() -> dict:
+        """Retrieval settings.
+
+        ``min_similarity`` may be a single number or a per-backend mapping; the
+        value for the active backend is resolved here so callers get a float.
+        Scores are cosine similarity in -1..1 — **higher is better**.
+
+        The RETRIEVAL_BACKEND env var overrides the config file, which makes it
+        easy to A/B the two backends without editing anything.
+        """
+        import os
+
         config = ConfigManager.load_config()
         block = config.get("retrieval", {})
+
+        backend = (os.environ.get("RETRIEVAL_BACKEND") or block.get("backend") or "tfidf").lower()
+
+        threshold = block.get("min_similarity", 0.2)
+        if isinstance(threshold, dict):
+            threshold = threshold.get(backend, 0.2)
+
         return {
+            "backend": backend,
+            "embedding_model": block.get("embedding_model", "text-embedding-3-small"),
             "top_k": int(block.get("top_k", 2)),
-            "max_distance": float(block.get("max_distance", 1.5)),
+            "min_similarity": float(threshold),
         }
 
     @staticmethod

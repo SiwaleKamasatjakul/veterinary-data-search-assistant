@@ -1,43 +1,57 @@
-"""Veterinary document store + TF-IDF/FAISS index.
+"""Veterinary document store + vector index.
 
-Changes from the Linux original — the reason the old artifacts could not move
-between machines:
+    VetDB     SQLite CRUD over the vet_doc table
+    VetFAISS  build / search the vector index
 
-* The index is saved with ``faiss.write_index`` / ``faiss.read_index`` instead of
-  ``pickle.dump(faiss_index)``. The old pickle embedded the SWIG module name
-  ``faiss.swigfaiss_avx2`` (an x86-64 AVX2 build), so loading it on Apple Silicon
-  raised ``ModuleNotFoundError: No module named 'faiss.swigfaiss_avx2'``.
-  ``write_index`` produces an architecture-independent file.
-* The vectorizer is saved with ``joblib`` (still a pickle under the hood, but the
-  index no longer depends on it, and it is rebuilt by ``build_index``).
-* Result assembly used ``if i < len(records) and j < len(D[0]) or D[0][j] >= threshold``
-  — ``and`` binds tighter than ``or``, so an out-of-range FAISS id (-1 on a short
-  index) could still pass the filter and raise IndexError. Now bounds are checked
-  first and the distance filter is separate.
-* Distances from ``IndexFlatL2`` are L2 *distances*: smaller is better. The old
-  code compared them against a ``similarity_threshold`` of 0.8 as if bigger were
-  better. The filter is now ``distance <= max_distance``.
-* Scores are converted to plain floats so the results are JSON-serialisable
-  (numpy.float32 is not).
+Backend-agnostic: the actual vectorisation lives in ``embedders.py`` and is
+chosen by ``retrieval.backend`` in config ("tfidf" or "openai").
 
-A note on the data: in vet_doc the ``symptoms`` column actually holds the disease
-name and ``cause`` holds the symptom list. The original indexed column 2 (``cause``),
-which is the right text to search on, so that behaviour is preserved here and the
-fields are surfaced under honest names in the results.
+Three design points worth knowing
+---------------------------------
+
+**1. Cosine similarity, higher is better.**
+All embedders return L2-normalised vectors, so ``IndexFlatIP`` (inner product)
+gives cosine similarity directly, in ``-1..1``. One score scale for both
+backends, and the threshold reads naturally: keep hits at or above
+``min_similarity``.
+
+*This is a polarity flip from the earlier version*, which used ``IndexFlatL2``
+and an upper bound on distance. If you have old notes saying "lower is better",
+they are out of date. Relationship for unit vectors: ``L2² = 2(1 − cos)``.
+
+**2. The index maps by data_id, not by position.**
+``IndexIDMap2`` stores each vector against its ``data_id``, so a search returns
+database IDs. Two consequences: deleting a row can no longer silently shift the
+mapping and return the wrong record, and lookup fetches only the top-k rows
+instead of ``SELECT *`` over the whole table.
+
+**3. TF-IDF must be rebuilt wholesale; OpenAI vectors can be cached.**
+``embedder.is_corpus_coupled`` says which. TF-IDF weights every term by how rare
+it is across the corpus, so adding one record invalidates every vector. OpenAI
+vectors are independent, so unchanged records are served from the embedding
+cache and only new or edited text is re-sent.
+
+A note on the data: in vet_doc the ``symptoms`` column holds the disease name
+and ``cause`` holds the symptom list (see ARCHITECTURE.md §6.2). ``_search_text``
+is the single place that decides what gets embedded.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import faiss
-import joblib
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
 
 from tools.config_loader import ConfigManager
+from tools.embedders import make_embedder
+from tools.embedding_cache import EmbeddingCache
+
+logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS vet_doc (
@@ -68,8 +82,20 @@ class VetDB:
     def get_all_vet_doc(db_name) -> List[dict]:
         VetDB.create_tables(db_name)
         with VetDB._connect(db_name) as conn:
-            rows = conn.execute("SELECT * FROM vet_doc ORDER BY data_id").fetchall()
-        return [dict(r) for r in rows]
+            return [dict(r) for r in conn.execute("SELECT * FROM vet_doc ORDER BY data_id")]
+
+    @staticmethod
+    def get_by_ids(db_name, data_ids) -> dict:
+        """Fetch only the rows a search actually hit. Returns {data_id: row}."""
+        data_ids = [int(i) for i in data_ids]
+        if not data_ids:
+            return {}
+        placeholders = ",".join("?" * len(data_ids))
+        with VetDB._connect(db_name) as conn:
+            rows = conn.execute(
+                f"SELECT * FROM vet_doc WHERE data_id IN ({placeholders})", data_ids
+            ).fetchall()
+        return {r["data_id"]: dict(r) for r in rows}
 
     @staticmethod
     def insert_many(db_name, records) -> int:
@@ -92,80 +118,152 @@ class VetDB:
 
 
 def _search_text(record: dict) -> str:
-    """The text a query is matched against — the symptom description."""
-    return (record.get("cause") or "") + " " + (record.get("symptoms") or "")
+    """The text a query is matched against — the symptom description.
+
+    Write this the way an OWNER would describe the problem, including colloquial
+    synonyms. With the tfidf backend a word absent from here can never match.
+    """
+    return ((record.get("cause") or "") + " " + (record.get("symptoms") or "")).strip()
+
+
+# ---------------------------------------------------------------------------
+# In-process cache: the index and embedder are immutable between rebuilds, so
+# there is no reason to read them from disk on every request. Keyed on the
+# index file's mtime, which a rebuild changes — so the cache self-invalidates.
+_RUNTIME: dict = {}
 
 
 class VetFAISS:
+    # -- build -----------------------------------------------------------
     @staticmethod
     def build_index(db_name=None) -> int:
-        """Fit the TF-IDF vectorizer, build the FAISS index, write both to disk."""
         cfg = ConfigManager.get_config_database()
+        retrieval = ConfigManager.get_retrieval_config()
         db_name = db_name or cfg["DB_NAME"]
-        index_file = cfg["FAISS_INDEX_FILE"]
-        vectorizer_file = cfg["TFIDF_VECTORIZER_FILE"]
 
         records = VetDB.get_all_vet_doc(db_name)
         if not records:
-            print("⚠️  vet_doc is empty — nothing to index.")
+            logger.warning("vet_doc is empty — nothing to index")
             return 0
 
         corpus = [_search_text(r) for r in records]
+        ids = np.array([r["data_id"] for r in records], dtype="int64")
 
-        # char ngrams, because Thai has no spaces between words: a word-level
-        # tokenizer would treat a whole phrase as one token and match almost nothing.
-        vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4))
-        tfidf_matrix = vectorizer.fit_transform(corpus)
+        embedder = make_embedder(retrieval["backend"], retrieval["embedding_model"])
 
-        vectors = np.asarray(tfidf_matrix.todense(), dtype="float32")
-        index = faiss.IndexFlatL2(vectors.shape[1])
-        index.add(vectors)
+        if embedder.is_corpus_coupled:
+            # TF-IDF: vocabulary and IDF depend on the whole corpus
+            embedder.fit(corpus)
+            vectors = embedder.encode(corpus)
+            detail = ""  # cache does not apply — TF-IDF always refits wholesale
+        else:
+            # OpenAI: independent vectors, so reuse whatever is already cached
+            cache = EmbeddingCache(cfg["EMBEDDING_CACHE"])
+            vectors, from_cache, embedded = cache.encode_with_cache(embedder, corpus)
+            detail = f" ({from_cache} from cache, {embedded} newly embedded)"
 
-        index_file.parent.mkdir(parents=True, exist_ok=True)
-        vectorizer_file.parent.mkdir(parents=True, exist_ok=True)
-        faiss.write_index(index, str(index_file))
-        joblib.dump(vectorizer, vectorizer_file)
+        index = faiss.IndexIDMap2(faiss.IndexFlatIP(vectors.shape[1]))
+        index.add_with_ids(vectors, ids)
 
-        print(f"✅ Indexed {len(records)} records (dim={vectors.shape[1]}) → {index_file.name}")
+        cfg["FAISS_INDEX_FILE"].parent.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(index, str(cfg["FAISS_INDEX_FILE"]))
+        embedder.save(cfg["EMBEDDER_FILE"])
+        cfg["INDEX_META_FILE"].write_text(
+            json.dumps(
+                {
+                    "backend": retrieval["backend"],
+                    "embedder": embedder.name,
+                    "dim": int(vectors.shape[1]),
+                    "records": len(records),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        _RUNTIME.clear()
+
+        print(
+            f"✅ Indexed {len(records)} records "
+            f"[{retrieval['backend']}/{embedder.name}, dim={vectors.shape[1]}]{detail}"
+        )
         return len(records)
 
+    # -- load ------------------------------------------------------------
     @staticmethod
-    def _load(db_name, index_file, vectorizer_file):
-        if not index_file.exists() or not vectorizer_file.exists():
-            print("⚠️  Index or vectorizer missing — building now...")
-            VetFAISS.build_index(db_name)
-        return faiss.read_index(str(index_file)), joblib.load(vectorizer_file)
+    def _load():
+        cfg = ConfigManager.get_config_database()
+        retrieval = ConfigManager.get_retrieval_config()
+        index_file = cfg["FAISS_INDEX_FILE"]
 
+        if not index_file.exists() or not cfg["EMBEDDER_FILE"].exists():
+            logger.info("Index missing — building")
+            VetFAISS.build_index(cfg["DB_NAME"])
+
+        if not cfg["INDEX_META_FILE"].exists():
+            # An index with no metadata predates the embedder refactor: it may be
+            # an IndexFlatL2 keyed by position, which this code would misread as
+            # data_ids. Rebuild rather than trust it.
+            logger.info("Index has no metadata (pre-refactor artifact) — rebuilding")
+            VetFAISS.build_index(cfg["DB_NAME"])
+
+        meta = json.loads(cfg["INDEX_META_FILE"].read_text(encoding="utf-8"))
+        if meta.get("backend") and meta["backend"] != retrieval["backend"]:
+            logger.info(
+                "Index was built with backend %r but config says %r — rebuilding",
+                meta["backend"], retrieval["backend"],
+            )
+            VetFAISS.build_index(cfg["DB_NAME"])
+
+        key = (str(index_file), index_file.stat().st_mtime_ns)
+        if key not in _RUNTIME:
+            _RUNTIME.clear()
+            embedder = make_embedder(retrieval["backend"], retrieval["embedding_model"])
+            embedder.load(cfg["EMBEDDER_FILE"])
+            _RUNTIME[key] = (faiss.read_index(str(index_file)), embedder)
+        return _RUNTIME[key]
+
+    # -- search ----------------------------------------------------------
     @staticmethod
-    def search_vet_doc(query_text: str, top_k: int | None = None, max_distance: float | None = None):
-        """Return the closest vet_doc records for a free-text symptom query."""
+    def search_vet_doc(
+        query_text: str,
+        top_k: Optional[int] = None,
+        min_similarity: Optional[float] = None,
+    ) -> List[dict]:
+        """Closest vet_doc records for a free-text symptom query.
+
+        ``score`` in each result is cosine similarity in -1..1. **Higher is
+        better** — this is the opposite of the old distance-based version.
+        """
         cfg = ConfigManager.get_config_database()
         retrieval = ConfigManager.get_retrieval_config()
         top_k = top_k or retrieval["top_k"]
-        max_distance = retrieval["max_distance"] if max_distance is None else max_distance
+        if min_similarity is None:
+            min_similarity = retrieval["min_similarity"]
 
         if not query_text or not query_text.strip():
             return []
 
-        index, vectorizer = VetFAISS._load(
-            cfg["DB_NAME"], cfg["FAISS_INDEX_FILE"], cfg["TFIDF_VECTORIZER_FILE"]
-        )
-        records = VetDB.get_all_vet_doc(cfg["DB_NAME"])
-        if not records or index.ntotal == 0:
+        index, embedder = VetFAISS._load()
+        if index.ntotal == 0:
             return []
 
-        query_vec = np.asarray(
-            vectorizer.transform([query_text]).todense(), dtype="float32"
-        )
-        distances, ids = index.search(query_vec, min(top_k, index.ntotal))
+        query_vec = embedder.encode([query_text])
+        scores, ids = index.search(query_vec, min(top_k, index.ntotal))
+
+        hit_ids = [int(i) for i in ids[0] if i != -1]
+        rows = VetDB.get_by_ids(cfg["DB_NAME"], hit_ids)
 
         results = []
-        for distance, record_pos in zip(distances[0], ids[0]):
-            if record_pos < 0 or record_pos >= len(records):
+        for score, data_id in zip(scores[0], ids[0]):
+            if data_id == -1:
                 continue
-            if float(distance) > max_distance:
+            if float(score) < min_similarity:
                 continue
-            rec = records[int(record_pos)]
+            rec = rows.get(int(data_id))
+            if not rec:
+                logger.warning("Index references data_id %s which is not in vet_doc", data_id)
+                continue
             results.append(
                 {
                     "data_id": rec["data_id"],
@@ -173,10 +271,17 @@ class VetFAISS:
                     "symptoms": rec["cause"],
                     "cause": rec["diagnosis"],
                     "treatment": rec["treatment"],
-                    "distance": round(float(distance), 4),
+                    "score": round(float(score), 4),
                 }
             )
         return results
+
+    @staticmethod
+    def index_info() -> dict:
+        cfg = ConfigManager.get_config_database()
+        if not cfg["INDEX_META_FILE"].exists():
+            return {}
+        return json.loads(cfg["INDEX_META_FILE"].read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
@@ -184,5 +289,5 @@ if __name__ == "__main__":
     if count:
         query = "ขนร่วงเป็นวง ๆ ผิวหนังแดง คัน มีสะเก็ดแห้งเป็นขุย"
         print(f"\n🔍 {query}")
-        for hit in VetFAISS.search_vet_doc(query, top_k=3):
-            print(f"  [{hit['distance']}] {hit['disease']}")
+        for hit in VetFAISS.search_vet_doc(query, top_k=3, min_similarity=-1):
+            print(f"  [{hit['score']}] {hit['disease']}")

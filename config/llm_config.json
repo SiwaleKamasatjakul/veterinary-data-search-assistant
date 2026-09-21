@@ -7,11 +7,19 @@
         "log_file_path": "logs"
     },
     "retrieval": {
+        "backend": "tfidf",
+        "embedding_model": "text-embedding-3-small",
         "top_k": 2,
-        "max_distance": 1.5
+        "min_similarity": {
+            "tfidf": 0.19,
+            "openai": 0.35
+        }
     },
     "DB_NAME": "data/vet_doc.db",
     "CHAT_HISTORY_DB": "data/chat_history.db",
+    "EMBEDDING_CACHE": "data/embedding_cache.db",
     "FAISS_INDEX_FILE": "src/vectordb/vet_doc.index",
-    "TFIDF_VECTORIZER_FILE": "src/vectordb/vet_doc_tfidf_vectorizer.joblib"
+    "EMBEDDER_FILE": "src/vectordb/vet_doc_embedder.joblib",
+    "INDEX_META_FILE": "src/vectordb/index_meta.json",
+    "backend": "openai"
 }
